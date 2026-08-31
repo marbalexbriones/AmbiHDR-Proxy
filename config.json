@@ -1,0 +1,19 @@
+{
+    "PROXY_ACTIVE": false,
+    "NUM_LEDS": 227,
+    "HEADER_OFFSET": 10,
+    "COLOR_SPACE": "REC2020",
+    "SWAP_RB": false,
+    "SMOOTHING": 0.0,
+    "EXPOSURE": 1.0,
+    "GAMMA": 2.2,
+    "SATURATION": 1.0,
+    "BLACK_CUTOFF": 2,
+    "GAIN_R": 1.0,
+    "GAIN_G": 1.0,
+    "GAIN_B": 1.0,
+    "LISTEN_IP": "0.0.0.0",
+    "LISTEN_PORT": 21324,
+    "WLED_IP": "192.168.100.190",
+    "WLED_PORT": 4048
+}

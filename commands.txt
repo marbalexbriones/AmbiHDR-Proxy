@@ -1,0 +1,8 @@
+docker rm -f hdr-proxy 2>/dev/null || true
+docker build -t hdr-proxy .
+docker run -d \
+  --name hdr-proxy \
+  --net=host \
+  --restart unless-stopped \
+  -v $(pwd)/config.json:/app/config.json \
+  hdr-proxy
