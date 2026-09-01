@@ -491,7 +491,7 @@ HTML_UI = """
 <body>
     <div class="card">
         <h2>Ambi<span class="hdr-h">H</span><span class="hdr-d">D</span><span class="hdr-r">R</span> Proxy</h2>
-        <div class="subtitle">v0.2.4</div>
+        <div class="subtitle">v0.2.5</div>
 
         <div class="status">
             Status: <b id="state-text" style="color: {{ '#4caf50' if config.PROXY_ACTIVE else '#f44336' }}">
