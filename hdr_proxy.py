@@ -7,15 +7,12 @@ import time
 import numpy as np
 from flask import Flask, render_template_string, request, jsonify
 
-
 def log(msg):
     print(f"[HDR-PROXY] {msg}", flush=True)
-
 
 CONFIG_FILE = "config.json"
 DDP_HEADER_SIZE = 10
 LUT_SIZE = 64
-
 
 PROFILE_DEFAULTS = {
     "EXPOSURE": 1.2,
@@ -53,13 +50,11 @@ stats_data = {
     "latency_ms": 0.0
 }
 
-
 def merge_dicts(base, override):
     merged = base.copy()
     if isinstance(override, dict):
         merged.update(override)
     return merged
-
 
 def normalize_config(raw_config):
     if not isinstance(raw_config, dict):
@@ -80,7 +75,6 @@ def normalize_config(raw_config):
 
     return normalized
 
-
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -94,14 +88,12 @@ def load_config():
     save_config(DEFAULT_CONFIG)
     return DEFAULT_CONFIG.copy()
 
-
 def save_config(config_data):
     try:
         with open(CONFIG_FILE, "w") as f:
             json.dump(config_data, f, indent=4)
     except Exception as e:
         log(f"Error saving config.json: {e}")
-
 
 config = load_config()
 
@@ -123,7 +115,6 @@ DCI_P3_TO_XYZ = np.array([
     [0.000000000, 0.047060, 0.907355],
 ], dtype=np.float32)
 
-
 def get_input_matrix(input_space):
     input_space = str(input_space).upper()
     if input_space == "REC2020":
@@ -132,13 +123,14 @@ def get_input_matrix(input_space):
         return np.matmul(XYZ_TO_REC709, DCI_P3_TO_XYZ).astype(np.float32)
     return np.eye(3, dtype=np.float32)
 
-
 app = Flask(__name__)
 
 LUT = np.zeros((LUT_SIZE, LUT_SIZE, LUT_SIZE, 3), dtype=np.uint8)
 lut_lock = threading.Lock()
 lut_queue = queue.Queue()
 
+prev_frame_float = None
+lut_updated_flag = False
 
 def get_active_profile():
     with config_lock:
@@ -155,7 +147,6 @@ def get_active_profile():
             "input_space": input_space,
         }
 
-
 def generate_lut_matrix(exposure, gamma, sat, cutoff, gain_r, gain_g, gain_b, input_space):
     steps = np.linspace(0.0, 1.0, LUT_SIZE, dtype=np.float32)
     grid_r, grid_g, grid_b = np.meshgrid(steps, steps, steps, indexing='ij')
@@ -165,16 +156,21 @@ def generate_lut_matrix(exposure, gamma, sat, cutoff, gain_r, gain_g, gain_b, in
 
     matrix = get_input_matrix(input_space)
     rgb_linear = np.matmul(rgb_in_linear, matrix.T)
-    rgb_linear = np.maximum(rgb_linear, 0.0, dtype=np.float32)
 
-    max_val = np.max(rgb_linear, axis=-1, keepdims=True)
-    max_val = np.maximum(max_val, 1e-6, dtype=np.float32)
+    min_val = np.min(rgb_linear, axis=-1, keepdims=True)
+    rgb_linear = np.where(min_val < 0.0, rgb_linear - min_val, rgb_linear)
 
-    max_scaled = max_val * exposure
-    max_mapped = max_scaled / (max_scaled + 0.5)
+    if str(input_space).upper() != "REC709":
+        max_val = np.max(rgb_linear, axis=-1, keepdims=True)
+        max_val = np.maximum(max_val, 1e-6, dtype=np.float32)
 
-    scale = max_mapped / max_val
-    rgb_mapped = rgb_linear * scale
+        max_scaled = max_val * exposure
+        max_mapped = max_scaled / (max_scaled + 0.5)
+
+        scale = max_mapped / max_val
+        rgb_mapped = rgb_linear * scale
+    else:
+        rgb_mapped = np.clip(rgb_linear * exposure, 0.0, 1.0)
 
     lum = 0.2126 * rgb_mapped[..., 0] + 0.7152 * rgb_mapped[..., 1] + 0.0722 * rgb_mapped[..., 2]
     lum_ext = np.expand_dims(lum, axis=-1)
@@ -193,9 +189,8 @@ def generate_lut_matrix(exposure, gamma, sat, cutoff, gain_r, gain_g, gain_b, in
     rgb_out[rgb_out < cutoff] = 0.0
     return np.clip(rgb_out, 0.0, 255.0).astype(np.uint8)
 
-
 def lut_worker():
-    global LUT
+    global LUT, lut_updated_flag
     while True:
         try:
             params = lut_queue.get()
@@ -211,14 +206,13 @@ def lut_worker():
             new_lut = generate_lut_matrix(*params)
             with lut_lock:
                 LUT = new_lut
+                lut_updated_flag = True
             log("3D LUT rebuilt successfully.")
             lut_queue.task_done()
         except Exception as e:
             log(f"Error in LUT worker: {e}")
 
-
 threading.Thread(target=lut_worker, daemon=True).start()
-
 
 def rebuild_lut_for_current_profile():
     profile = get_active_profile()
@@ -235,11 +229,7 @@ def rebuild_lut_for_current_profile():
     )
     lut_queue.put(lut_params)
 
-
 rebuild_lut_for_current_profile()
-
-prev_frame_float = None
-
 
 def extract_ddp_rgb(raw_bytes, num_leds):
     if len(raw_bytes) <= DDP_HEADER_SIZE:
@@ -257,9 +247,8 @@ def extract_ddp_rgb(raw_bytes, num_leds):
         return None
     return rgb.reshape(-1, 3)
 
-
 def tone_map_udp_fast(raw_bytes, num_leds, smoothing):
-    global prev_frame_float
+    global prev_frame_float, lut_updated_flag
 
     rgb_in = extract_ddp_rgb(raw_bytes, num_leds)
     if rgb_in is None:
@@ -268,6 +257,9 @@ def tone_map_udp_fast(raw_bytes, num_leds, smoothing):
     idx = rgb_in >> 2
     with lut_lock:
         rgb_out = LUT[idx[:, 0], idx[:, 1], idx[:, 2]].copy()
+        if lut_updated_flag:
+            prev_frame_float = None
+            lut_updated_flag = False
 
     if smoothing > 0.0:
         current_float = rgb_out.astype(np.float32)
@@ -281,7 +273,6 @@ def tone_map_udp_fast(raw_bytes, num_leds, smoothing):
 
     header = raw_bytes[:DDP_HEADER_SIZE]
     return header + rgb_out.tobytes()
-
 
 def udp_loop():
     sock_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -363,7 +354,6 @@ def udp_loop():
 
         except Exception as e:
             log(f"Error in UDP socket: {e}")
-
 
 HTML_UI = """
 <!DOCTYPE html>
@@ -474,11 +464,7 @@ HTML_UI = """
             background: #2a2a2a; border: 1px solid #444; color: var(--text); border-radius: 8px; padding: 9px 10px;
         }
 
-        /* Slider base (gris claro para todos) */
-        input[type=range] {
-            accent-color: #e2e8f0;
-        }
-        /* Sobreescritura específica para sliders RGB */
+        input[type=range] { accent-color: #e2e8f0; }
         input[type=range].slider-red { accent-color: #ff4d4d; }
         input[type=range].slider-green { accent-color: #4caf50; }
         input[type=range].slider-blue { accent-color: #2196f3; }
@@ -504,9 +490,7 @@ HTML_UI = """
 </head>
 <body>
     <div class="card">
-        <h2>
-            Ambi<span class="hdr-h">H</span><span class="hdr-d">D</span><span class="hdr-r">R</span> Proxy
-        </h2>
+        <h2>Ambi<span class="hdr-h">H</span><span class="hdr-d">D</span><span class="hdr-r">R</span> Proxy</h2>
         <div class="subtitle">v0.2.4</div>
 
         <div class="status">
@@ -858,24 +842,20 @@ HTML_UI = """
 </html>
 """
 
-
 @app.route("/")
 def index():
     with config_lock:
         cfg_copy = config.copy()
     return render_template_string(HTML_UI, config=cfg_copy)
 
-
 @app.route('/favicon.ico')
 def favicon():
     return ('', 204)
-
 
 @app.route('/stats')
 def stats():
     with stats_lock:
         return jsonify(stats_data)
-
 
 @app.route("/update_config", methods=["POST"])
 def update_config():
@@ -919,7 +899,6 @@ def update_config():
 
     return jsonify({"status": "ok", "active_mode": config.get("ACTIVE_MODE", "HDR")})
 
-
 @app.route("/toggle", methods=["POST"])
 def toggle():
     with config_lock:
@@ -927,7 +906,6 @@ def toggle():
         save_config(config)
         state = config["PROXY_ACTIVE"]
     return jsonify({"proxy_active": state, "active_mode": config.get("ACTIVE_MODE", "HDR")})
-
 
 if __name__ == "__main__":
     log("Starting UDP loop on thread...")
