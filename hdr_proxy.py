@@ -1,18 +1,32 @@
 import os
 import json
 import socket
+import select
 import threading
 import queue
 import time
+import hashlib
 import numpy as np
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, Response
+from waitress import serve
 
 def log(msg):
     print(f"[HDR-PROXY] {msg}", flush=True)
 
 CONFIG_FILE = "config.json"
 DDP_HEADER_SIZE = 10
-LUT_SIZE = 64
+LUT_SIZE = 256
+
+# Buffers globales y Memoria Dual (Zero-Allocation pointer)
+MAX_DDP_PAYLOAD = 1440
+MAX_LEDS = MAX_DDP_PAYLOAD // 3
+
+LUT_SDR = np.zeros((LUT_SIZE**3, 3), dtype=np.uint8)
+LUT_HDR = np.zeros((LUT_SIZE**3, 3), dtype=np.uint8)
+ACTIVE_LUT = LUT_HDR 
+
+prealloc_rgb = np.empty((MAX_LEDS, 3), dtype=np.uint8)
+out_buffer = bytearray(MAX_DDP_PAYLOAD + DDP_HEADER_SIZE)
 
 PROFILE_DEFAULTS = {
     "EXPOSURE": 1.2,
@@ -122,157 +136,176 @@ def get_input_matrix(input_space):
     return np.eye(3, dtype=np.float32)
 
 app = Flask(__name__)
-
-LUT = np.zeros((LUT_SIZE, LUT_SIZE, LUT_SIZE, 3), dtype=np.uint8)
-lut_lock = threading.Lock()
 lut_queue = queue.Queue()
-lut_updated_flag = False
 
-def get_active_profile():
+# Diccionario de estado independiente por modo
+build_status = {"SDR": False, "HDR": False}
+
+def set_active_lut_pointer():
+    global ACTIVE_LUT
     with config_lock:
-        active_mode = str(config.get("ACTIVE_MODE", "HDR")).upper()
-        if active_mode == "SDR":
+        active = config.get("ACTIVE_MODE", "HDR")
+    ACTIVE_LUT = LUT_SDR if active == "SDR" else LUT_HDR
+
+set_active_lut_pointer()
+
+def get_profile_params(mode):
+    with config_lock:
+        if mode == "SDR":
             profile = config.get("PROFILE_SDR", SDR_PROFILE_DEFAULTS.copy())
             input_space = "REC709"
         else:
             profile = config.get("PROFILE_HDR", HDR_PROFILE_DEFAULTS.copy())
             input_space = profile.get("INPUT_COLOR_SPACE", "REC2020")
-        return {
-            "mode": active_mode,
-            "profile": profile,
-            "input_space": input_space,
-        }
+            
+        return (
+            float(profile.get("EXPOSURE", 1.2)),
+            float(profile.get("GAMMA", 2.0)),
+            float(profile.get("SATURATION", 1.1)),
+            float(profile.get("VIBRANCE", 0.0)),
+            float(profile.get("GAIN_R", 1.0)),
+            float(profile.get("GAIN_G", 1.0)),
+            float(profile.get("GAIN_B", 1.0)),
+            input_space,
+        )
 
 def generate_lut_matrix(exposure, gamma, sat, vibrance, gain_r, gain_g, gain_b, input_space):
+    lut = np.zeros((LUT_SIZE, LUT_SIZE, LUT_SIZE, 3), dtype=np.uint8)
     steps = np.linspace(0.0, 1.0, LUT_SIZE, dtype=np.float32)
-    grid_r, grid_g, grid_b = np.meshgrid(steps, steps, steps, indexing='ij')
-    rgb_grid = np.stack([grid_r, grid_g, grid_b], axis=-1)
-
-    rgb_in_linear = np.power(rgb_grid, 2.2, dtype=np.float32)
-
+    
+    grid_g, grid_b = np.meshgrid(steps, steps, indexing='ij')
     matrix = get_input_matrix(input_space)
-    rgb_linear = np.matmul(rgb_in_linear, matrix.T)
+    inv_gamma = 1.0 / max(gamma, 0.1)
 
-    min_val = np.min(rgb_linear, axis=-1, keepdims=True)
-    rgb_linear = np.where(min_val < 0.0, rgb_linear - min_val, rgb_linear)
+    for r_idx, r_val in enumerate(steps):
+        rgb_slice = np.stack([np.full_like(grid_g, r_val), grid_g, grid_b], axis=-1)
+        rgb_in_linear = np.power(rgb_slice, 2.2, dtype=np.float32)
 
-    if str(input_space).upper() != "REC709":
-        max_val = np.max(rgb_linear, axis=-1, keepdims=True)
-        max_val = np.maximum(max_val, 1e-6, dtype=np.float32)
+        rgb_linear = np.matmul(rgb_in_linear, matrix.T)
 
-        max_scaled = max_val * exposure
-        max_mapped = max_scaled / (max_scaled + 0.5)
+        min_val = np.min(rgb_linear, axis=-1, keepdims=True)
+        rgb_linear = np.where(min_val < 0.0, rgb_linear - min_val, rgb_linear)
 
-        scale = max_mapped / max_val
-        rgb_mapped = rgb_linear * scale
-    else:
-        rgb_mapped = np.clip(rgb_linear * exposure, 0.0, 1.0)
+        if str(input_space).upper() != "REC709":
+            max_val = np.max(rgb_linear, axis=-1, keepdims=True)
+            max_val = np.maximum(max_val, 1e-6, dtype=np.float32)
 
-    lum = 0.2126 * rgb_mapped[..., 0] + 0.7152 * rgb_mapped[..., 1] + 0.0722 * rgb_mapped[..., 2]
-    lum_ext = np.expand_dims(lum, axis=-1)
+            max_scaled = max_val * exposure
+            max_mapped = max_scaled / (max_scaled + 0.5)
 
-    # Saturación base (lineal)
-    rgb_mapped = lum_ext + sat * (rgb_mapped - lum_ext)
-    rgb_mapped = np.clip(rgb_mapped, 0.0, 1.0)
+            scale = max_mapped / max_val
+            rgb_mapped = rgb_linear * scale
+        else:
+            rgb_mapped = np.clip(rgb_linear * exposure, 0.0, 1.0)
 
-    # Saturación inteligente (Vibrance)
-    if vibrance != 0.0:
-        max_c = np.max(rgb_mapped, axis=-1, keepdims=True)
-        min_c = np.min(rgb_mapped, axis=-1, keepdims=True)
-        
-        # sat_mask es mayor (cerca de 1.0) cuando el píxel es desaturado (grisáceo)
-        # y tiende a 0.0 cuando el píxel ya es puro (altamente saturado).
-        sat_mask = 1.0 - (max_c - min_c)
-        
-        # Aplicamos el boost de vibrance apoyándonos en la máscara
-        rgb_mapped = lum_ext + (1.0 + (vibrance * sat_mask)) * (rgb_mapped - lum_ext)
+        lum = 0.2126 * rgb_mapped[..., 0] + 0.7152 * rgb_mapped[..., 1] + 0.0722 * rgb_mapped[..., 2]
+        lum_ext = np.expand_dims(lum, axis=-1)
+
+        rgb_mapped = lum_ext + sat * (rgb_mapped - lum_ext)
         rgb_mapped = np.clip(rgb_mapped, 0.0, 1.0)
 
-    inv_gamma = 1.0 / max(gamma, 0.1)
-    rgb_srgb = np.power(rgb_mapped, inv_gamma, dtype=np.float32)
+        if vibrance != 0.0:
+            max_c = np.max(rgb_mapped, axis=-1, keepdims=True)
+            min_c = np.min(rgb_mapped, axis=-1, keepdims=True)
+            sat_mask = 1.0 - (max_c - min_c)
+            rgb_mapped = lum_ext + (1.0 + (vibrance * sat_mask)) * (rgb_mapped - lum_ext)
+            rgb_mapped = np.clip(rgb_mapped, 0.0, 1.0)
 
-    rgb_srgb[..., 0] *= gain_r
-    rgb_srgb[..., 1] *= gain_g
-    rgb_srgb[..., 2] *= gain_b
+        rgb_srgb = np.power(rgb_mapped, inv_gamma, dtype=np.float32)
 
-    rgb_out = rgb_srgb * 255.0
-    return np.clip(rgb_out, 0.0, 255.0).astype(np.uint8)
+        rgb_srgb[..., 0] *= gain_r
+        rgb_srgb[..., 1] *= gain_g
+        rgb_srgb[..., 2] *= gain_b
+
+        lut[r_idx] = np.clip(rgb_srgb * 255.0, 0.0, 255.0).astype(np.uint8)
+
+    return lut
 
 def lut_worker():
-    global LUT, lut_updated_flag
     while True:
         try:
-            params = lut_queue.get()
-            if params is None:
+            task = lut_queue.get()
+            if task is None:
                 break
+                
+            mode, params = task
+            hash_str = hashlib.md5(str(params).encode()).hexdigest()
+            cache_filename = f"lut_cache_{mode}_{hash_str}.npy"
 
-            while not lut_queue.empty():
-                try:
-                    params = lut_queue.get_nowait()
-                except queue.Empty:
-                    break
+            t_start = time.perf_counter()
 
-            new_lut = generate_lut_matrix(*params)
-            with lut_lock:
-                LUT = new_lut
-                lut_updated_flag = True
-            log("3D LUT rebuilt successfully.")
+            if os.path.exists(cache_filename):
+                log(f"Cache hit for {mode} ({hash_str}). Loading from disk...")
+                new_lut_flat = np.load(cache_filename)
+                log(f"LUT {mode} loaded in {(time.perf_counter() - t_start)*1000:.1f} ms.")
+            else:
+                log(f"Cache miss for {mode}. Generating new 256³ LUT...")
+                new_lut = generate_lut_matrix(*params)
+                new_lut_flat = new_lut.reshape(-1, 3)
+                np.save(cache_filename, new_lut_flat)
+                log(f"LUT {mode} generated and cached in {(time.perf_counter() - t_start):.2f} seconds.")
+
+                for f in os.listdir('.'):
+                    if f.startswith(f"lut_cache_{mode}_") and f != cache_filename:
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            pass
+
+            if mode == "SDR":
+                LUT_SDR[:] = new_lut_flat
+            else:
+                LUT_HDR[:] = new_lut_flat
+
+            build_status[mode] = False
             lut_queue.task_done()
+            
         except Exception as e:
-            log(f"Error in LUT worker: {e}")
+            build_status[mode] = False
+            log(f"Error in LUT worker for {mode}: {e}")
 
 threading.Thread(target=lut_worker, daemon=True).start()
 
-def rebuild_lut_for_current_profile():
-    profile = get_active_profile()
-    active_profile = profile["profile"]
-    lut_params = (
-        float(active_profile.get("EXPOSURE", 1.2)),
-        float(active_profile.get("GAMMA", 2.0)),
-        float(active_profile.get("SATURATION", 1.1)),
-        float(active_profile.get("VIBRANCE", 0.0)),
-        float(active_profile.get("GAIN_R", 1.0)),
-        float(active_profile.get("GAIN_G", 1.0)),
-        float(active_profile.get("GAIN_B", 1.0)),
-        profile["input_space"],
-    )
-    lut_queue.put(lut_params)
+def init_all_profiles():
+    build_status["SDR"] = True
+    lut_queue.put(("SDR", get_profile_params("SDR")))
+    build_status["HDR"] = True
+    lut_queue.put(("HDR", get_profile_params("HDR")))
 
-rebuild_lut_for_current_profile()
-
-def extract_ddp_rgb(raw_bytes):
-    if len(raw_bytes) <= DDP_HEADER_SIZE:
-        return None
-
-    payload = raw_bytes[DDP_HEADER_SIZE:]
-    valid_length = (len(payload) // 3) * 3
-    
-    if valid_length == 0:
-        return None
-
-    payload = payload[:valid_length]
-    rgb = np.frombuffer(payload, dtype=np.uint8)
-    return rgb.reshape(-1, 3)
+init_all_profiles()
 
 def tone_map_udp_fast(raw_bytes):
-    global lut_updated_flag
-
-    rgb_in = extract_ddp_rgb(raw_bytes)
-    if rgb_in is None:
+    packet_len = len(raw_bytes)
+    if packet_len <= DDP_HEADER_SIZE:
         return raw_bytes
 
-    idx = rgb_in >> 2
-    with lut_lock:
-        rgb_out = LUT[idx[:, 0], idx[:, 1], idx[:, 2]].copy()
-        if lut_updated_flag:
-            lut_updated_flag = False
+    payload_length = int.from_bytes(raw_bytes[8:10], byteorder='big')
+    pixel_bytes = min(payload_length, packet_len - DDP_HEADER_SIZE)
+    valid_pixels = pixel_bytes // 3
+    
+    if valid_pixels == 0 or valid_pixels > MAX_LEDS:
+        return raw_bytes
 
-    header = raw_bytes[:DDP_HEADER_SIZE]
-    return header + rgb_out.tobytes()
+    rgb_in = np.frombuffer(raw_bytes, dtype=np.uint8, count=valid_pixels * 3, offset=DDP_HEADER_SIZE).reshape(-1, 3)
+
+    r32 = rgb_in[:, 0].astype(np.uint32)
+    g32 = rgb_in[:, 1].astype(np.uint32)
+    b32 = rgb_in[:, 2].astype(np.uint32)
+    idx = (r32 << 16) | (g32 << 8) | b32
+
+    local_lut = ACTIVE_LUT 
+    
+    np.take(local_lut, idx, axis=0, out=prealloc_rgb[:valid_pixels])
+
+    out_buffer[:DDP_HEADER_SIZE] = raw_bytes[:DDP_HEADER_SIZE]
+    out_buffer[DDP_HEADER_SIZE:DDP_HEADER_SIZE + valid_pixels * 3] = prealloc_rgb[:valid_pixels].data
+
+    return memoryview(out_buffer)[:DDP_HEADER_SIZE + valid_pixels * 3]
 
 def udp_loop():
     sock_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock_in.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    sock_in.setblocking(False)
 
     with config_lock:
         listen_ip = config["LISTEN_IP"]
@@ -294,24 +327,28 @@ def udp_loop():
                 proxy_active = config["PROXY_ACTIVE"]
                 perf_monitor_active = config.get("PERF_MONITOR_ACTIVE", True)
 
-            data, _ = sock_in.recvfrom(4096)
-            if perf_monitor_active:
-                recv_count += 1
+            # OS-Level Draining: Wait for incoming packet gracefully (max 1 second delay if idle)
+            readable, _, _ = select.select([sock_in], [], [], 1.0)
+            if not readable:
+                continue
 
-            sock_in.setblocking(False)
+            data = None
+            
+            # Drain exactly the available packets without raising exception blocks
             while True:
-                try:
-                    more_data, _ = sock_in.recvfrom(4096)
-                    if len(more_data) > DDP_HEADER_SIZE:
-                        data = more_data
-                        if perf_monitor_active:
-                            recv_count += 1
-                except BlockingIOError:
+                ready_to_drain, _, _ = select.select([sock_in], [], [], 0.0)
+                if not ready_to_drain:
                     break
-            sock_in.setblocking(True)
-
-            if len(data) > DDP_HEADER_SIZE:
+                    
+                chunk, _ = sock_in.recvfrom(4096)
+                if len(chunk) > DDP_HEADER_SIZE:
+                    data = chunk
+                    if perf_monitor_active:
+                        recv_count += 1
+            
+            if data and len(data) > DDP_HEADER_SIZE:
                 t0 = time.perf_counter() if perf_monitor_active else 0
+                
                 if proxy_active:
                     processed = tone_map_udp_fast(data)
                     sock_out.sendto(processed, (wled_target_ip, wled_target_port))
@@ -344,6 +381,7 @@ def udp_loop():
 
         except Exception as e:
             log(f"Error in UDP socket: {e}")
+            time.sleep(1)
 
 HTML_UI = """
 <!DOCTYPE html>
@@ -375,7 +413,56 @@ HTML_UI = """
         }
         h2 { margin: 0; text-align: center; }
         .subtitle { text-align: center; color: #7d7d7d; font-size: 11px; font-weight: bold; margin-bottom: 12px; }
-        .status { text-align: center; margin: 12px 0 18px; font-size: 15px; color: var(--muted); }
+        
+        .status-container { display: flex; justify-content: center; align-items: center; margin: 12px 0 18px; font-size: 15px; color: var(--muted); }
+        .status-text b { margin-left: 5px; }
+        
+        .spinner-container {
+            position: relative;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            margin-left: 10px;
+            cursor: help;
+        }
+        
+        .spinner {
+            border: 3px solid rgba(255, 255, 255, 0.1);
+            width: 18px; height: 18px;
+            border-radius: 50%;
+            border-left-color: var(--accent);
+            animation: spin 1s linear infinite;
+        }
+        
+        .spinner-container .tooltip {
+            visibility: hidden;
+            width: 220px;
+            background-color: #2a2a2a;
+            color: #e2e8f0;
+            text-align: center;
+            border-radius: 8px;
+            padding: 8px 10px;
+            position: absolute;
+            z-index: 100;
+            top: 130%;
+            left: 50%;
+            margin-left: -110px;
+            opacity: 0;
+            transition: opacity 0.2s;
+            font-size: 11px;
+            font-weight: normal;
+            border: 1px solid var(--line);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            pointer-events: none;
+        }
+
+        .spinner-container:hover .tooltip {
+            visibility: visible;
+            opacity: 1;
+        }
+
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
         .toggle-btn {
             width: 100%; padding: 14px 12px; margin-bottom: 16px; border: none; font-size: 16px;
             border-radius: 10px; font-weight: bold; cursor: pointer; color: var(--text);
@@ -419,7 +506,7 @@ HTML_UI = """
         .tab-btn:hover { color: var(--text); }
         .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); background: none; }
 
-        .tab-panel { display: none; }
+        .tab-panel { display: none; transition: opacity 0.2s ease; }
         .tab-panel.active { display: block; }
         
         .section-header {
@@ -453,18 +540,27 @@ HTML_UI = """
         .control-group input[type=text], .control-group input[type=number], .control-group select {
             background: #2a2a2a; border: 1px solid #444; color: var(--text); border-radius: 8px; padding: 9px 10px;
         }
+        
+        input:disabled, select:disabled, button:disabled { cursor: not-allowed; }
 
         input[type=range] { accent-color: #e2e8f0; }
         input[type=range].slider-red { accent-color: #ff4d4d; }
         input[type=range].slider-green { accent-color: #4caf50; }
         input[type=range].slider-blue { accent-color: #2196f3; }
 
-        .btn-apply, .btn-restore {
-            width: 100%; padding: 10px 12px; border: none; border-radius: 8px; cursor: pointer; margin-top: 12px;
-            font-weight: bold; color: var(--text);
+        .btn-apply, .btn-generate, .btn-restore {
+            width: 100%; padding: 12px; border: none; border-radius: 8px; cursor: pointer; margin-top: 12px;
+            font-weight: bold; color: var(--text); transition: 0.2s;
         }
-        .btn-apply { background: #0d79bb; }
-        .btn-restore { background: #2a2a2a; border: 1px solid var(--line); color: #d9d9d9; }
+        
+        .btn-apply { background: #1ea7ff; color: #111; }
+        .btn-apply:hover { background: #5bbdff; }
+        
+        .btn-generate { background: #0d79bb; }
+        .btn-generate:hover { background: #1191df; }
+        
+        .btn-restore { background: transparent; border: 1px solid #E6274E; color: #E6274E; margin-top: 8px; padding: 10px; }
+        .btn-restore:hover { background: rgba(230, 39, 78, 0.1); }
 
         .perf-grid {
             display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px;
@@ -481,12 +577,12 @@ HTML_UI = """
 <body>
     <div class="card">
         <h2>Ambi<span class="hdr-h">H</span><span class="hdr-d">D</span><span class="hdr-r">R</span> Proxy</h2>
-        <div class="subtitle">v0.2.7 - Con Vibrance Integrado</div>
+        <div class="subtitle">v0.6.0</div>
 
-        <div class="status">
-            Status: <b id="state-text" style="color: {{ '#4caf50' if config.PROXY_ACTIVE else '#f44336' }}">
+        <div class="status-container">
+            <span class="status-text">Status: <b id="state-text" style="color: {{ '#4caf50' if config.PROXY_ACTIVE else '#f44336' }}">
                 {{ 'Pass-through' if not config.PROXY_ACTIVE else ('HDR Correction' if config.ACTIVE_MODE == 'HDR' else 'SDR Correction') }}
-            </b>
+            </b></span>
         </div>
 
         <button id="power-btn" class="toggle-btn {{ 'on' if config.PROXY_ACTIVE else 'off' }}" onclick="toggleProxy()">
@@ -494,7 +590,13 @@ HTML_UI = """
         </button>
 
         <div class="mode-toggle-container">
-            <span class="mode-title">Active Mode</span>
+            <div style="display: flex; align-items: center; gap: 5px;">
+                <span class="mode-title">Active Mode</span>
+                <div id="lut-spinner-wrapper" class="spinner-container">
+                    <div class="spinner"></div>
+                    <span class="tooltip">Generating LUT(s).</span>
+                </div>
+            </div>
             <div class="segmented-control">
                 <input type="checkbox" id="hdr-mode-toggle" {{ 'checked' if config.ACTIVE_MODE == 'HDR' else '' }} onchange="toggleMode(this.checked)">
                 <label for="hdr-mode-toggle" class="toggle-switch">
@@ -517,36 +619,37 @@ HTML_UI = """
             </div>
             <div class="control-group">
                 <label>Exposure <span id="sdr-exp-val">{{ config.PROFILE_SDR.EXPOSURE }}</span></label>
-                <input id="sdr-exp-slider" type="range" min="0.5" max="3.0" step="0.1" value="{{ config.PROFILE_SDR.EXPOSURE }}" oninput="updateProfile('sdr')">
+                <input id="sdr-exp-slider" type="range" min="0.5" max="3.0" step="0.1" value="{{ config.PROFILE_SDR.EXPOSURE }}" oninput="updateProfileLabels('sdr')">
             </div>
             <div class="control-group">
                 <label>Gamma <span id="sdr-gamma-val">{{ config.PROFILE_SDR.GAMMA }}</span></label>
-                <input id="sdr-gamma-slider" type="range" min="1.0" max="3.0" step="0.1" value="{{ config.PROFILE_SDR.GAMMA }}" oninput="updateProfile('sdr')">
+                <input id="sdr-gamma-slider" type="range" min="1.0" max="3.0" step="0.1" value="{{ config.PROFILE_SDR.GAMMA }}" oninput="updateProfileLabels('sdr')">
             </div>
             <div class="control-group">
                 <label>Saturation <span id="sdr-sat-val">{{ config.PROFILE_SDR.SATURATION }}</span></label>
-                <input id="sdr-sat-slider" type="range" min="0.5" max="2.0" step="0.1" value="{{ config.PROFILE_SDR.SATURATION }}" oninput="updateProfile('sdr')">
+                <input id="sdr-sat-slider" type="range" min="0.5" max="2.0" step="0.1" value="{{ config.PROFILE_SDR.SATURATION }}" oninput="updateProfileLabels('sdr')">
             </div>
             <div class="control-group">
                 <label>Vibrance <span id="sdr-vibrance-val">{{ config.PROFILE_SDR.VIBRANCE }}</span></label>
-                <input id="sdr-vibrance-slider" type="range" min="0.0" max="2.0" step="0.1" value="{{ config.PROFILE_SDR.VIBRANCE }}" oninput="updateProfile('sdr')">
+                <input id="sdr-vibrance-slider" type="range" min="0.0" max="2.0" step="0.1" value="{{ config.PROFILE_SDR.VIBRANCE }}" oninput="updateProfileLabels('sdr')">
             </div>
             <div class="section-header">
                 <span class="section-title">Color Balance (RGB)</span>
             </div>
             <div class="control-group">
                 <label>Red <span id="sdr-r-val">{{ config.PROFILE_SDR.GAIN_R }}</span></label>
-                <input id="sdr-r-slider" class="slider-red" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_SDR.GAIN_R }}" oninput="updateProfile('sdr')">
+                <input id="sdr-r-slider" class="slider-red" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_SDR.GAIN_R }}" oninput="updateProfileLabels('sdr')">
             </div>
             <div class="control-group">
                 <label>Green <span id="sdr-g-val">{{ config.PROFILE_SDR.GAIN_G }}</span></label>
-                <input id="sdr-g-slider" class="slider-green" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_SDR.GAIN_G }}" oninput="updateProfile('sdr')">
+                <input id="sdr-g-slider" class="slider-green" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_SDR.GAIN_G }}" oninput="updateProfileLabels('sdr')">
             </div>
             <div class="control-group">
                 <label>Blue <span id="sdr-b-val">{{ config.PROFILE_SDR.GAIN_B }}</span></label>
-                <input id="sdr-b-slider" class="slider-blue" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_SDR.GAIN_B }}" oninput="updateProfile('sdr')">
+                <input id="sdr-b-slider" class="slider-blue" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_SDR.GAIN_B }}" oninput="updateProfileLabels('sdr')">
             </div>
-            <button class="btn-restore" onclick="restoreProfileDefaults('sdr')">Restore SDR Defaults</button>
+            <button class="btn-generate" onclick="emitProfile('sdr')">Generate LUT</button>
+            <button class="btn-restore" onclick="restoreProfileDefaults('sdr')">Restore Defaults</button>
         </div>
 
         <div id="tab-hdr" class="tab-panel">
@@ -555,43 +658,44 @@ HTML_UI = """
             </div>
             <div class="control-group">
                 <label>Input Color Space</label>
-                <select id="hdr-color-space" onchange="updateProfile('hdr')">
+                <select id="hdr-color-space" onchange="updateProfileLabels('hdr')">
                     <option value="REC2020" {{ 'selected' if config.PROFILE_HDR.INPUT_COLOR_SPACE == 'REC2020' else '' }}>Rec.2020 (HDR10 / Dolby Vision)</option>
                     <option value="DCIP3" {{ 'selected' if config.PROFILE_HDR.INPUT_COLOR_SPACE == 'DCIP3' else '' }}>DCI-P3 (Apple Display / Cinema)</option>
                 </select>
             </div>
             <div class="control-group">
                 <label>Exposure <span id="hdr-exp-val">{{ config.PROFILE_HDR.EXPOSURE }}</span></label>
-                <input id="hdr-exp-slider" type="range" min="0.5" max="3.0" step="0.1" value="{{ config.PROFILE_HDR.EXPOSURE }}" oninput="updateProfile('hdr')">
+                <input id="hdr-exp-slider" type="range" min="0.5" max="3.0" step="0.1" value="{{ config.PROFILE_HDR.EXPOSURE }}" oninput="updateProfileLabels('hdr')">
             </div>
             <div class="control-group">
                 <label>Gamma <span id="hdr-gamma-val">{{ config.PROFILE_HDR.GAMMA }}</span></label>
-                <input id="hdr-gamma-slider" type="range" min="1.0" max="3.0" step="0.1" value="{{ config.PROFILE_HDR.GAMMA }}" oninput="updateProfile('hdr')">
+                <input id="hdr-gamma-slider" type="range" min="1.0" max="3.0" step="0.1" value="{{ config.PROFILE_HDR.GAMMA }}" oninput="updateProfileLabels('hdr')">
             </div>
             <div class="control-group">
                 <label>Saturation <span id="hdr-sat-val">{{ config.PROFILE_HDR.SATURATION }}</span></label>
-                <input id="hdr-sat-slider" type="range" min="0.5" max="2.0" step="0.1" value="{{ config.PROFILE_HDR.SATURATION }}" oninput="updateProfile('hdr')">
+                <input id="hdr-sat-slider" type="range" min="0.5" max="2.0" step="0.1" value="{{ config.PROFILE_HDR.SATURATION }}" oninput="updateProfileLabels('hdr')">
             </div>
             <div class="control-group">
                 <label>Vibrance <span id="hdr-vibrance-val">{{ config.PROFILE_HDR.VIBRANCE }}</span></label>
-                <input id="hdr-vibrance-slider" type="range" min="0.0" max="2.0" step="0.1" value="{{ config.PROFILE_HDR.VIBRANCE }}" oninput="updateProfile('hdr')">
+                <input id="hdr-vibrance-slider" type="range" min="0.0" max="2.0" step="0.1" value="{{ config.PROFILE_HDR.VIBRANCE }}" oninput="updateProfileLabels('hdr')">
             </div>
             <div class="section-header">
                 <span class="section-title">Color Balance (RGB)</span>
             </div>
             <div class="control-group">
                 <label>Red <span id="hdr-r-val">{{ config.PROFILE_HDR.GAIN_R }}</span></label>
-                <input id="hdr-r-slider" class="slider-red" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_HDR.GAIN_R }}" oninput="updateProfile('hdr')">
+                <input id="hdr-r-slider" class="slider-red" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_HDR.GAIN_R }}" oninput="updateProfileLabels('hdr')">
             </div>
             <div class="control-group">
                 <label>Green <span id="hdr-g-val">{{ config.PROFILE_HDR.GAIN_G }}</span></label>
-                <input id="hdr-g-slider" class="slider-green" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_HDR.GAIN_G }}" oninput="updateProfile('hdr')">
+                <input id="hdr-g-slider" class="slider-green" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_HDR.GAIN_G }}" oninput="updateProfileLabels('hdr')">
             </div>
             <div class="control-group">
                 <label>Blue <span id="hdr-b-val">{{ config.PROFILE_HDR.GAIN_B }}</span></label>
-                <input id="hdr-b-slider" class="slider-blue" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_HDR.GAIN_B }}" oninput="updateProfile('hdr')">
+                <input id="hdr-b-slider" class="slider-blue" type="range" min="0.5" max="2.0" step="0.05" value="{{ config.PROFILE_HDR.GAIN_B }}" oninput="updateProfileLabels('hdr')">
             </div>
-            <button class="btn-restore" onclick="restoreProfileDefaults('hdr')">Restore HDR Defaults</button>
+            <button class="btn-generate" onclick="emitProfile('hdr')">Generate LUT</button>
+            <button class="btn-restore" onclick="restoreProfileDefaults('hdr')">Restore Defaults</button>
         </div>
 
         <div id="tab-settings" class="tab-panel">
@@ -638,8 +742,43 @@ HTML_UI = """
         let activeProxyState = CONFIG.PROXY_ACTIVE;
         let activeModeState = CONFIG.ACTIVE_MODE;
         let perfMonitorActive = CONFIG.PERF_MONITOR_ACTIVE;
-        let statsInterval = null;
-        let debounceTimer;
+
+        // Establecer conexión bidireccional (Server-Sent Events)
+        const evtSource = new EventSource("/events");
+        evtSource.onmessage = function(e) {
+            const payload = JSON.parse(e.data);
+            
+            // Actualización asíncrona de telemetría UDP
+            if (payload.stats && perfMonitorActive) {
+                document.getElementById('perf-recv-fps').textContent = payload.stats.received_fps;
+                document.getElementById('perf-proc-fps').textContent = payload.stats.processed_fps;
+                document.getElementById('perf-latency').textContent = `${payload.stats.latency_ms} ms`;
+            }
+
+            // Actualización asíncrona de estado de hilos de construcción (LUT)
+            if (payload.lut) {
+                let isBuildingAny = false;
+                ['SDR', 'HDR'].forEach(mode => {
+                    if (payload.lut[mode]) {
+                        lockUIForMode(mode, true);
+                        isBuildingAny = true;
+                    } else {
+                        lockUIForMode(mode, false);
+                    }
+                });
+                document.getElementById('lut-spinner-wrapper').style.display = isBuildingAny ? 'flex' : 'none';
+            }
+        };
+
+        function lockUIForMode(mode, lock) {
+            if (!mode) return;
+            const tab = document.getElementById('tab-' + mode.toLowerCase());
+            if (tab) {
+                tab.querySelectorAll('input, select, button').forEach(el => el.disabled = lock);
+                tab.style.opacity = lock ? '0.4' : '1';
+                tab.style.pointerEvents = lock ? 'none' : 'auto';
+            }
+        }
 
         function showTab(tab) {
             document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tab));
@@ -693,16 +832,8 @@ HTML_UI = """
 
             if (enabled) {
                 boxes.forEach(b => b.classList.remove('disabled'));
-                fetchStats();
-                if (!statsInterval) {
-                    statsInterval = setInterval(fetchStats, 1000);
-                }
             } else {
                 boxes.forEach(b => b.classList.add('disabled'));
-                if (statsInterval) {
-                    clearInterval(statsInterval);
-                    statsInterval = null;
-                }
                 document.getElementById('perf-recv-fps').textContent = 'OFF';
                 document.getElementById('perf-proc-fps').textContent = 'OFF';
                 document.getElementById('perf-latency').textContent = 'OFF';
@@ -738,20 +869,12 @@ HTML_UI = """
                 profile.input_color_space = document.getElementById('hdr-color-space').value;
             }
             payload[profileKey === 'sdr' ? 'profile_sdr' : 'profile_hdr'] = profile;
-            clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => {
-                fetch('/update_config', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-            }, 120);
-            updateProfileLabels(profileKey);
-        }
-
-        function updateProfile(profileKey) {
-            updateProfileLabels(profileKey);
-            emitProfile(profileKey);
+            
+            fetch('/update_config', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
         }
 
         function applySettings() {
@@ -767,7 +890,7 @@ HTML_UI = """
         }
 
         function restoreProfileDefaults(profileKey) {
-            if (!confirm(`Restore default ${profileKey.toUpperCase()} settings?`)) return;
+            if (!confirm(`¿Restaurar los valores por defecto para ${profileKey.toUpperCase()}?`)) return;
             const defaults = profileKey === 'sdr' ? {
                 exposure: 1.2, gamma: 2.0, saturation: 1.1, vibrance: 0.0, gain_r: 1.0, gain_g: 1.0, gain_b: 1.0
             } : {
@@ -786,27 +909,13 @@ HTML_UI = """
                 document.getElementById('hdr-color-space').value = defaults.input_color_space;
             }
 
-            updateProfile(profileKey);
-        }
-
-        function fetchStats() {
-            if (!perfMonitorActive) return;
-            fetch('/stats')
-                .then(res => res.json())
-                .then(data => {
-                    document.getElementById('perf-recv-fps').textContent = data.received_fps;
-                    document.getElementById('perf-proc-fps').textContent = data.processed_fps;
-                    document.getElementById('perf-latency').textContent = `${data.latency_ms} ms`;
-                })
-                .catch(() => {});
+            updateProfileLabels(profileKey);
+            emitProfile(profileKey);
         }
 
         document.addEventListener('DOMContentLoaded', () => {
             ['sdr', 'hdr'].forEach(updateProfileLabels);
-            if (perfMonitorActive) {
-                fetchStats();
-                statsInterval = setInterval(fetchStats, 1000);
-            } else {
+            if (!perfMonitorActive) {
                 togglePerfMonitoring(false);
             }
         });
@@ -825,10 +934,31 @@ def index():
 def favicon():
     return ('', 204)
 
-@app.route('/stats')
-def stats():
-    with stats_lock:
-        return jsonify(stats_data)
+@app.route('/events')
+def events():
+    def event_stream():
+        last_stats = None
+        last_lut = None
+        while True:
+            with stats_lock:
+                current_stats = stats_data.copy()
+            current_lut = build_status.copy()
+
+            payload = {}
+            if current_stats != last_stats:
+                payload['stats'] = current_stats
+                last_stats = current_stats
+            
+            if current_lut != last_lut:
+                payload['lut'] = current_lut
+                last_lut = current_lut
+
+            if payload:
+                yield f"data: {json.dumps(payload)}\n\n"
+            
+            time.sleep(0.2)
+            
+    return Response(event_stream(), mimetype='text/event-stream')
 
 @app.route("/update_config", methods=["POST"])
 def update_config():
@@ -839,11 +969,12 @@ def update_config():
             mode = str(data["active_mode"]).upper()
             if mode in {"SDR", "HDR"}:
                 config["ACTIVE_MODE"] = mode
+                set_active_lut_pointer()
 
         if "perf_monitor_active" in data:
             config["PERF_MONITOR_ACTIVE"] = bool(data["perf_monitor_active"])
 
-        for target_key, payload_key in [("PROFILE_SDR", "profile_sdr"), ("PROFILE_HDR", "profile_hdr")]:
+        for target_key, payload_key, mode_str in [("PROFILE_SDR", "profile_sdr", "SDR"), ("PROFILE_HDR", "profile_hdr", "HDR")]:
             if payload_key in data and isinstance(data[payload_key], dict):
                 p_data = data[payload_key]
                 mapped = {}
@@ -859,15 +990,18 @@ def update_config():
                             mapped[key_upper] = float(v)
                         except (ValueError, TypeError):
                             mapped[key_upper] = v
+                
                 config[target_key].update(mapped)
+                
+                build_status[mode_str] = True
+                lut_queue.put((mode_str, get_profile_params(mode_str)))
 
         if "wled_ip" in data and data["wled_ip"]: config["WLED_IP"] = str(data["wled_ip"])
         if "wled_port" in data: config["WLED_PORT"] = int(data["wled_port"])
 
         save_config(config)
-        rebuild_lut_for_current_profile()
 
-    return jsonify({"status": "ok", "active_mode": config.get("ACTIVE_MODE", "HDR")})
+    return jsonify({"status": "ok"})
 
 @app.route("/toggle", methods=["POST"])
 def toggle():
@@ -878,8 +1012,8 @@ def toggle():
     return jsonify({"proxy_active": state, "active_mode": config.get("ACTIVE_MODE", "HDR")})
 
 if __name__ == "__main__":
-    log("Starting UDP loop on thread...")
+    log("Starting OS-Level UDP socket listener...")
     t = threading.Thread(target=udp_loop, daemon=True)
     t.start()
-    log("Starting Flask server on port 5000...")
-    app.run(host="0.0.0.0", port=5000)
+    log("Starting Waitress WSGI server on port 5000...")
+    serve(app, host="0.0.0.0", port=5000)
