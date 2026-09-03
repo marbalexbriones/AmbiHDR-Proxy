@@ -594,7 +594,7 @@ HTML_UI = """
                 <span class="mode-title">Active Mode</span>
                 <div id="lut-spinner-wrapper" class="spinner-container">
                     <div class="spinner"></div>
-                    <span class="tooltip">Generating LUT(s).</span>
+                    <span class="tooltip">Generating LUT(s). Controls isolated to prevent desynchronization.</span>
                 </div>
             </div>
             <div class="segmented-control">
@@ -890,7 +890,7 @@ HTML_UI = """
         }
 
         function restoreProfileDefaults(profileKey) {
-            if (!confirm(`¿Restaurar los valores por defecto para ${profileKey.toUpperCase()}?`)) return;
+            if (!confirm(`Restore default values for ${profileKey.toUpperCase()}?`)) return;
             const defaults = profileKey === 'sdr' ? {
                 exposure: 1.2, gamma: 2.0, saturation: 1.1, vibrance: 0.0, gain_r: 1.0, gain_g: 1.0, gain_b: 1.0
             } : {
