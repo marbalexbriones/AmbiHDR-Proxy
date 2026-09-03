@@ -18,8 +18,7 @@ PROFILE_DEFAULTS = {
     "EXPOSURE": 1.2,
     "GAMMA": 2.0,
     "SATURATION": 1.1,
-    "BLACK_CUTOFF": 5,
-    "SMOOTHING": 0.0,
+    "VIBRANCE": 0.0,
     "GAIN_R": 1.0,
     "GAIN_G": 1.0,
     "GAIN_B": 1.0,
@@ -32,7 +31,6 @@ DEFAULT_CONFIG = {
     "PROXY_ACTIVE": True,
     "ACTIVE_MODE": "HDR",
     "PERF_MONITOR_ACTIVE": True,
-    "NUM_LEDS": 227,
     "LISTEN_IP": "0.0.0.0",
     "LISTEN_PORT": 21324,
     "WLED_IP": "192.168.100.190",
@@ -128,8 +126,6 @@ app = Flask(__name__)
 LUT = np.zeros((LUT_SIZE, LUT_SIZE, LUT_SIZE, 3), dtype=np.uint8)
 lut_lock = threading.Lock()
 lut_queue = queue.Queue()
-
-prev_frame_float = None
 lut_updated_flag = False
 
 def get_active_profile():
@@ -147,7 +143,7 @@ def get_active_profile():
             "input_space": input_space,
         }
 
-def generate_lut_matrix(exposure, gamma, sat, cutoff, gain_r, gain_g, gain_b, input_space):
+def generate_lut_matrix(exposure, gamma, sat, vibrance, gain_r, gain_g, gain_b, input_space):
     steps = np.linspace(0.0, 1.0, LUT_SIZE, dtype=np.float32)
     grid_r, grid_g, grid_b = np.meshgrid(steps, steps, steps, indexing='ij')
     rgb_grid = np.stack([grid_r, grid_g, grid_b], axis=-1)
@@ -175,8 +171,22 @@ def generate_lut_matrix(exposure, gamma, sat, cutoff, gain_r, gain_g, gain_b, in
     lum = 0.2126 * rgb_mapped[..., 0] + 0.7152 * rgb_mapped[..., 1] + 0.0722 * rgb_mapped[..., 2]
     lum_ext = np.expand_dims(lum, axis=-1)
 
+    # Saturación base (lineal)
     rgb_mapped = lum_ext + sat * (rgb_mapped - lum_ext)
     rgb_mapped = np.clip(rgb_mapped, 0.0, 1.0)
+
+    # Saturación inteligente (Vibrance)
+    if vibrance != 0.0:
+        max_c = np.max(rgb_mapped, axis=-1, keepdims=True)
+        min_c = np.min(rgb_mapped, axis=-1, keepdims=True)
+        
+        # sat_mask es mayor (cerca de 1.0) cuando el píxel es desaturado (grisáceo)
+        # y tiende a 0.0 cuando el píxel ya es puro (altamente saturado).
+        sat_mask = 1.0 - (max_c - min_c)
+        
+        # Aplicamos el boost de vibrance apoyándonos en la máscara
+        rgb_mapped = lum_ext + (1.0 + (vibrance * sat_mask)) * (rgb_mapped - lum_ext)
+        rgb_mapped = np.clip(rgb_mapped, 0.0, 1.0)
 
     inv_gamma = 1.0 / max(gamma, 0.1)
     rgb_srgb = np.power(rgb_mapped, inv_gamma, dtype=np.float32)
@@ -186,7 +196,6 @@ def generate_lut_matrix(exposure, gamma, sat, cutoff, gain_r, gain_g, gain_b, in
     rgb_srgb[..., 2] *= gain_b
 
     rgb_out = rgb_srgb * 255.0
-    rgb_out[rgb_out < cutoff] = 0.0
     return np.clip(rgb_out, 0.0, 255.0).astype(np.uint8)
 
 def lut_worker():
@@ -221,7 +230,7 @@ def rebuild_lut_for_current_profile():
         float(active_profile.get("EXPOSURE", 1.2)),
         float(active_profile.get("GAMMA", 2.0)),
         float(active_profile.get("SATURATION", 1.1)),
-        int(active_profile.get("BLACK_CUTOFF", 5)),
+        float(active_profile.get("VIBRANCE", 0.0)),
         float(active_profile.get("GAIN_R", 1.0)),
         float(active_profile.get("GAIN_G", 1.0)),
         float(active_profile.get("GAIN_B", 1.0)),
@@ -231,26 +240,24 @@ def rebuild_lut_for_current_profile():
 
 rebuild_lut_for_current_profile()
 
-def extract_ddp_rgb(raw_bytes, num_leds):
+def extract_ddp_rgb(raw_bytes):
     if len(raw_bytes) <= DDP_HEADER_SIZE:
         return None
 
-    payload = raw_bytes[DDP_HEADER_SIZE:DDP_HEADER_SIZE + num_leds * 3]
-    if len(payload) == 0:
+    payload = raw_bytes[DDP_HEADER_SIZE:]
+    valid_length = (len(payload) // 3) * 3
+    
+    if valid_length == 0:
         return None
 
-    if len(payload) < num_leds * 3:
-        payload = payload[: len(payload) - (len(payload) % 3)]
-
+    payload = payload[:valid_length]
     rgb = np.frombuffer(payload, dtype=np.uint8)
-    if rgb.size == 0:
-        return None
     return rgb.reshape(-1, 3)
 
-def tone_map_udp_fast(raw_bytes, num_leds, smoothing):
-    global prev_frame_float, lut_updated_flag
+def tone_map_udp_fast(raw_bytes):
+    global lut_updated_flag
 
-    rgb_in = extract_ddp_rgb(raw_bytes, num_leds)
+    rgb_in = extract_ddp_rgb(raw_bytes)
     if rgb_in is None:
         return raw_bytes
 
@@ -258,18 +265,7 @@ def tone_map_udp_fast(raw_bytes, num_leds, smoothing):
     with lut_lock:
         rgb_out = LUT[idx[:, 0], idx[:, 1], idx[:, 2]].copy()
         if lut_updated_flag:
-            prev_frame_float = None
             lut_updated_flag = False
-
-    if smoothing > 0.0:
-        current_float = rgb_out.astype(np.float32)
-        if prev_frame_float is None or prev_frame_float.shape != current_float.shape:
-            prev_frame_float = current_float
-        else:
-            prev_frame_float = (prev_frame_float * smoothing) + (current_float * (1.0 - smoothing))
-            rgb_out = np.clip(prev_frame_float, 0.0, 255.0).astype(np.uint8)
-    else:
-        prev_frame_float = None
 
     header = raw_bytes[:DDP_HEADER_SIZE]
     return header + rgb_out.tobytes()
@@ -297,12 +293,6 @@ def udp_loop():
                 wled_target_port = config["WLED_PORT"]
                 proxy_active = config["PROXY_ACTIVE"]
                 perf_monitor_active = config.get("PERF_MONITOR_ACTIVE", True)
-                num_leds = config["NUM_LEDS"]
-                active_mode = str(config.get("ACTIVE_MODE", "HDR")).upper()
-                if active_mode == "SDR":
-                    smoothing = float(config["PROFILE_SDR"].get("SMOOTHING", 0.0))
-                else:
-                    smoothing = float(config["PROFILE_HDR"].get("SMOOTHING", 0.0))
 
             data, _ = sock_in.recvfrom(4096)
             if perf_monitor_active:
@@ -323,7 +313,7 @@ def udp_loop():
             if len(data) > DDP_HEADER_SIZE:
                 t0 = time.perf_counter() if perf_monitor_active else 0
                 if proxy_active:
-                    processed = tone_map_udp_fast(data, num_leds, smoothing)
+                    processed = tone_map_udp_fast(data)
                     sock_out.sendto(processed, (wled_target_ip, wled_target_port))
                 else:
                     sock_out.sendto(data, (wled_target_ip, wled_target_port))
@@ -491,7 +481,7 @@ HTML_UI = """
 <body>
     <div class="card">
         <h2>Ambi<span class="hdr-h">H</span><span class="hdr-d">D</span><span class="hdr-r">R</span> Proxy</h2>
-        <div class="subtitle">v0.2.5</div>
+        <div class="subtitle">v0.2.7 - Con Vibrance Integrado</div>
 
         <div class="status">
             Status: <b id="state-text" style="color: {{ '#4caf50' if config.PROXY_ACTIVE else '#f44336' }}">
@@ -538,12 +528,8 @@ HTML_UI = """
                 <input id="sdr-sat-slider" type="range" min="0.5" max="2.0" step="0.1" value="{{ config.PROFILE_SDR.SATURATION }}" oninput="updateProfile('sdr')">
             </div>
             <div class="control-group">
-                <label>Black Cutoff <span id="sdr-cutoff-val">{{ config.PROFILE_SDR.BLACK_CUTOFF }}</span></label>
-                <input id="sdr-cutoff-slider" type="range" min="0" max="25" step="1" value="{{ config.PROFILE_SDR.BLACK_CUTOFF }}" oninput="updateProfile('sdr')">
-            </div>
-            <div class="control-group">
-                <label>Smoothing <span id="sdr-smooth-val">{{ config.PROFILE_SDR.SMOOTHING }}</span></label>
-                <input id="sdr-smooth-slider" type="range" min="0.0" max="0.8" step="0.05" value="{{ config.PROFILE_SDR.SMOOTHING }}" oninput="updateProfile('sdr')">
+                <label>Vibrance <span id="sdr-vibrance-val">{{ config.PROFILE_SDR.VIBRANCE }}</span></label>
+                <input id="sdr-vibrance-slider" type="range" min="0.0" max="2.0" step="0.1" value="{{ config.PROFILE_SDR.VIBRANCE }}" oninput="updateProfile('sdr')">
             </div>
             <div class="section-header">
                 <span class="section-title">Color Balance (RGB)</span>
@@ -587,12 +573,8 @@ HTML_UI = """
                 <input id="hdr-sat-slider" type="range" min="0.5" max="2.0" step="0.1" value="{{ config.PROFILE_HDR.SATURATION }}" oninput="updateProfile('hdr')">
             </div>
             <div class="control-group">
-                <label>Black Cutoff <span id="hdr-cutoff-val">{{ config.PROFILE_HDR.BLACK_CUTOFF }}</span></label>
-                <input id="hdr-cutoff-slider" type="range" min="0" max="25" step="1" value="{{ config.PROFILE_HDR.BLACK_CUTOFF }}" oninput="updateProfile('hdr')">
-            </div>
-            <div class="control-group">
-                <label>Smoothing <span id="hdr-smooth-val">{{ config.PROFILE_HDR.SMOOTHING }}</span></label>
-                <input id="hdr-smooth-slider" type="range" min="0.0" max="0.8" step="0.05" value="{{ config.PROFILE_HDR.SMOOTHING }}" oninput="updateProfile('hdr')">
+                <label>Vibrance <span id="hdr-vibrance-val">{{ config.PROFILE_HDR.VIBRANCE }}</span></label>
+                <input id="hdr-vibrance-slider" type="range" min="0.0" max="2.0" step="0.1" value="{{ config.PROFILE_HDR.VIBRANCE }}" oninput="updateProfile('hdr')">
             </div>
             <div class="section-header">
                 <span class="section-title">Color Balance (RGB)</span>
@@ -636,7 +618,7 @@ HTML_UI = """
             </div>
 
             <div class="section-header">
-                <span class="section-title">Network & Hardware Settings</span>
+                <span class="section-title">Network Settings</span>
             </div>
             <div class="control-group">
                 <label>WLED Target IP</label>
@@ -645,10 +627,6 @@ HTML_UI = """
             <div class="control-group">
                 <label>WLED Target Port</label>
                 <input id="settings-wled-port" type="number" min="1" max="65535" value="{{ config.WLED_PORT }}">
-            </div>
-            <div class="control-group">
-                <label>Number of LEDs</label>
-                <input id="settings-leds" type="number" min="1" max="1000" value="{{ config.NUM_LEDS }}">
             </div>
 
             <button class="btn-apply" onclick="applySettings()">Save Settings</button>
@@ -732,16 +710,14 @@ HTML_UI = """
         }
 
         function updateProfileLabels(profileKey) {
-            const suffixes = ['exp', 'gamma', 'sat', 'cutoff', 'smooth', 'r', 'g', 'b'];
+            const suffixes = ['exp', 'gamma', 'sat', 'vibrance', 'r', 'g', 'b'];
             suffixes.forEach((suffix) => {
                 const valueEl = document.getElementById(`${profileKey}-${suffix}-val`);
                 if (valueEl) {
                     const slider = document.getElementById(`${profileKey}-${suffix}-slider`);
                     if (!slider) return;
                     const value = parseFloat(slider.value);
-                    if (suffix === 'cutoff') valueEl.textContent = parseInt(value, 10);
-                    else if (suffix === 'smooth') valueEl.textContent = value.toFixed(2);
-                    else if (suffix === 'r' || suffix === 'g' || suffix === 'b') valueEl.textContent = value.toFixed(2);
+                    if (suffix === 'r' || suffix === 'g' || suffix === 'b') valueEl.textContent = value.toFixed(2);
                     else valueEl.textContent = value.toFixed(1);
                 }
             });
@@ -753,8 +729,7 @@ HTML_UI = """
                 exposure: parseFloat(document.getElementById(`${profileKey}-exp-slider`).value),
                 gamma: parseFloat(document.getElementById(`${profileKey}-gamma-slider`).value),
                 saturation: parseFloat(document.getElementById(`${profileKey}-sat-slider`).value),
-                black_cutoff: parseInt(document.getElementById(`${profileKey}-cutoff-slider`).value, 10),
-                smoothing: parseFloat(document.getElementById(`${profileKey}-smooth-slider`).value),
+                vibrance: parseFloat(document.getElementById(`${profileKey}-vibrance-slider`).value),
                 gain_r: parseFloat(document.getElementById(`${profileKey}-r-slider`).value),
                 gain_g: parseFloat(document.getElementById(`${profileKey}-g-slider`).value),
                 gain_b: parseFloat(document.getElementById(`${profileKey}-b-slider`).value)
@@ -782,8 +757,7 @@ HTML_UI = """
         function applySettings() {
             const payload = {
                 wled_ip: document.getElementById('settings-wled-ip').value.trim(),
-                wled_port: parseInt(document.getElementById('settings-wled-port').value, 10) || 4048,
-                num_leds: parseInt(document.getElementById('settings-leds').value, 10) || 227
+                wled_port: parseInt(document.getElementById('settings-wled-port').value, 10) || 4048
             };
             fetch('/update_config', {
                 method: 'POST',
@@ -795,16 +769,15 @@ HTML_UI = """
         function restoreProfileDefaults(profileKey) {
             if (!confirm(`Restore default ${profileKey.toUpperCase()} settings?`)) return;
             const defaults = profileKey === 'sdr' ? {
-                exposure: 1.2, gamma: 2.0, saturation: 1.1, black_cutoff: 5, smoothing: 0.0, gain_r: 1.0, gain_g: 1.0, gain_b: 1.0
+                exposure: 1.2, gamma: 2.0, saturation: 1.1, vibrance: 0.0, gain_r: 1.0, gain_g: 1.0, gain_b: 1.0
             } : {
-                exposure: 1.2, gamma: 2.0, saturation: 1.1, black_cutoff: 5, smoothing: 0.0, gain_r: 1.0, gain_g: 1.0, gain_b: 1.0, input_color_space: 'REC2020'
+                exposure: 1.2, gamma: 2.0, saturation: 1.1, vibrance: 0.0, gain_r: 1.0, gain_g: 1.0, gain_b: 1.0, input_color_space: 'REC2020'
             };
 
             document.getElementById(`${profileKey}-exp-slider`).value = defaults.exposure;
             document.getElementById(`${profileKey}-gamma-slider`).value = defaults.gamma;
             document.getElementById(`${profileKey}-sat-slider`).value = defaults.saturation;
-            document.getElementById(`${profileKey}-cutoff-slider`).value = defaults.black_cutoff;
-            document.getElementById(`${profileKey}-smooth-slider`).value = defaults.smoothing;
+            document.getElementById(`${profileKey}-vibrance-slider`).value = defaults.vibrance;
             document.getElementById(`${profileKey}-r-slider`).value = defaults.gain_r;
             document.getElementById(`${profileKey}-g-slider`).value = defaults.gain_g;
             document.getElementById(`${profileKey}-b-slider`).value = defaults.gain_b;
@@ -876,9 +849,7 @@ def update_config():
                 mapped = {}
                 for k, v in p_data.items():
                     key_upper = k.upper()
-                    if key_upper == "BLACK_CUTOFF":
-                        mapped[key_upper] = int(v)
-                    elif key_upper == "INPUT_COLOR_SPACE":
+                    if key_upper == "INPUT_COLOR_SPACE":
                         val_upper = str(v).upper()
                         if target_key == "PROFILE_HDR" and val_upper not in {"REC2020", "DCIP3"}:
                             val_upper = "REC2020"
@@ -892,7 +863,6 @@ def update_config():
 
         if "wled_ip" in data and data["wled_ip"]: config["WLED_IP"] = str(data["wled_ip"])
         if "wled_port" in data: config["WLED_PORT"] = int(data["wled_port"])
-        if "num_leds" in data: config["NUM_LEDS"] = int(data["num_leds"])
 
         save_config(config)
         rebuild_lut_for_current_profile()
