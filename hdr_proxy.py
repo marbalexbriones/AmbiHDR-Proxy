@@ -7,7 +7,7 @@ import queue
 import time
 import hashlib
 import numpy as np
-from flask import Flask, render_template_string, request, jsonify, Response
+from flask import Flask, render_template_string, request, jsonify
 from waitress import serve
 
 def log(msg):
@@ -327,14 +327,12 @@ def udp_loop():
                 proxy_active = config["PROXY_ACTIVE"]
                 perf_monitor_active = config.get("PERF_MONITOR_ACTIVE", True)
 
-            # OS-Level Draining: Wait for incoming packet gracefully (max 1 second delay if idle)
+            # OS-Level Draining: Esperar hasta 1 segundo si no hay datos físicos
             readable, _, _ = select.select([sock_in], [], [], 1.0)
             if not readable:
                 continue
 
-            data = None
-            
-            # Drain exactly the available packets without raising exception blocks
+            # Procesar y enviar TODO el buffer disponible instantáneamente paquete por paquete
             while True:
                 ready_to_drain, _, _ = select.select([sock_in], [], [], 0.0)
                 if not ready_to_drain:
@@ -342,23 +340,19 @@ def udp_loop():
                     
                 chunk, _ = sock_in.recvfrom(4096)
                 if len(chunk) > DDP_HEADER_SIZE:
-                    data = chunk
                     if perf_monitor_active:
                         recv_count += 1
-            
-            if data and len(data) > DDP_HEADER_SIZE:
-                t0 = time.perf_counter() if perf_monitor_active else 0
-                
-                if proxy_active:
-                    processed = tone_map_udp_fast(data)
-                    sock_out.sendto(processed, (wled_target_ip, wled_target_port))
-                else:
-                    sock_out.sendto(data, (wled_target_ip, wled_target_port))
+                        t0 = time.perf_counter()
+                    
+                    if proxy_active:
+                        processed = tone_map_udp_fast(chunk)
+                        sock_out.sendto(processed, (wled_target_ip, wled_target_port))
+                    else:
+                        sock_out.sendto(chunk, (wled_target_ip, wled_target_port))
 
-                if perf_monitor_active:
-                    t1 = time.perf_counter()
-                    proc_count += 1
-                    latency_accum_ms += (t1 - t0) * 1000.0
+                    if perf_monitor_active:
+                        proc_count += 1
+                        latency_accum_ms += (time.perf_counter() - t0) * 1000.0
 
             if perf_monitor_active:
                 now = time.perf_counter()
@@ -577,7 +571,7 @@ HTML_UI = """
 <body>
     <div class="card">
         <h2>Ambi<span class="hdr-h">H</span><span class="hdr-d">D</span><span class="hdr-r">R</span> Proxy</h2>
-        <div class="subtitle">v0.6.0</div>
+        <div class="subtitle">v0.6.1 - Stabilized Polling Architecture</div>
 
         <div class="status-container">
             <span class="status-text">Status: <b id="state-text" style="color: {{ '#4caf50' if config.PROXY_ACTIVE else '#f44336' }}">
@@ -594,7 +588,7 @@ HTML_UI = """
                 <span class="mode-title">Active Mode</span>
                 <div id="lut-spinner-wrapper" class="spinner-container">
                     <div class="spinner"></div>
-                    <span class="tooltip">Generating LUT(s). Controls isolated to prevent desynchronization.</span>
+                    <span class="tooltip">Generating LUTs matrix. Controls isolated to prevent desynchronization.</span>
                 </div>
             </div>
             <div class="segmented-control">
@@ -742,33 +736,7 @@ HTML_UI = """
         let activeProxyState = CONFIG.PROXY_ACTIVE;
         let activeModeState = CONFIG.ACTIVE_MODE;
         let perfMonitorActive = CONFIG.PERF_MONITOR_ACTIVE;
-
-        // Establecer conexión bidireccional (Server-Sent Events)
-        const evtSource = new EventSource("/events");
-        evtSource.onmessage = function(e) {
-            const payload = JSON.parse(e.data);
-            
-            // Actualización asíncrona de telemetría UDP
-            if (payload.stats && perfMonitorActive) {
-                document.getElementById('perf-recv-fps').textContent = payload.stats.received_fps;
-                document.getElementById('perf-proc-fps').textContent = payload.stats.processed_fps;
-                document.getElementById('perf-latency').textContent = `${payload.stats.latency_ms} ms`;
-            }
-
-            // Actualización asíncrona de estado de hilos de construcción (LUT)
-            if (payload.lut) {
-                let isBuildingAny = false;
-                ['SDR', 'HDR'].forEach(mode => {
-                    if (payload.lut[mode]) {
-                        lockUIForMode(mode, true);
-                        isBuildingAny = true;
-                    } else {
-                        lockUIForMode(mode, false);
-                    }
-                });
-                document.getElementById('lut-spinner-wrapper').style.display = isBuildingAny ? 'flex' : 'none';
-            }
-        };
+        let statsInterval = null;
 
         function lockUIForMode(mode, lock) {
             if (!mode) return;
@@ -779,6 +747,35 @@ HTML_UI = """
                 tab.style.pointerEvents = lock ? 'none' : 'auto';
             }
         }
+
+        function checkLutStatus() {
+            fetch('/lut_status')
+                .then(res => res.json())
+                .then(data => {
+                    let isBuildingAny = false;
+                    ['SDR', 'HDR'].forEach(mode => {
+                        if (data[mode]) {
+                            lockUIForMode(mode, true);
+                            isBuildingAny = true;
+                        } else {
+                            lockUIForMode(mode, false);
+                        }
+                    });
+                    
+                    document.getElementById('lut-spinner-wrapper').style.display = isBuildingAny ? 'flex' : 'none';
+                    
+                    if (isBuildingAny) {
+                        setTimeout(checkLutStatus, 300);
+                    }
+                })
+                .catch(() => {
+                    document.getElementById('lut-spinner-wrapper').style.display = 'none';
+                    ['SDR', 'HDR'].forEach(mode => lockUIForMode(mode, false));
+                });
+        }
+
+        // Initialize state tracker
+        checkLutStatus();
 
         function showTab(tab) {
             document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tab));
@@ -804,7 +801,7 @@ HTML_UI = """
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ active_mode: activeModeState })
-            });
+            }).then(() => setTimeout(checkLutStatus, 150));
         }
 
         function toggleProxy() {
@@ -832,8 +829,16 @@ HTML_UI = """
 
             if (enabled) {
                 boxes.forEach(b => b.classList.remove('disabled'));
+                fetchStats();
+                if (!statsInterval) {
+                    statsInterval = setInterval(fetchStats, 1000);
+                }
             } else {
                 boxes.forEach(b => b.classList.add('disabled'));
+                if (statsInterval) {
+                    clearInterval(statsInterval);
+                    statsInterval = null;
+                }
                 document.getElementById('perf-recv-fps').textContent = 'OFF';
                 document.getElementById('perf-proc-fps').textContent = 'OFF';
                 document.getElementById('perf-latency').textContent = 'OFF';
@@ -874,7 +879,7 @@ HTML_UI = """
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
-            });
+            }).then(() => setTimeout(checkLutStatus, 150));
         }
 
         function applySettings() {
@@ -886,7 +891,7 @@ HTML_UI = """
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
-            }).then(() => alert('Settings saved.'));
+            }).then(() => alert('Settings saved successfully.'));
         }
 
         function restoreProfileDefaults(profileKey) {
@@ -913,9 +918,24 @@ HTML_UI = """
             emitProfile(profileKey);
         }
 
+        function fetchStats() {
+            if (!perfMonitorActive) return;
+            fetch('/stats')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('perf-recv-fps').textContent = data.received_fps;
+                    document.getElementById('perf-proc-fps').textContent = data.processed_fps;
+                    document.getElementById('perf-latency').textContent = `${data.latency_ms} ms`;
+                })
+                .catch(() => {});
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
             ['sdr', 'hdr'].forEach(updateProfileLabels);
-            if (!perfMonitorActive) {
+            if (perfMonitorActive) {
+                fetchStats();
+                statsInterval = setInterval(fetchStats, 1000);
+            } else {
                 togglePerfMonitoring(false);
             }
         });
@@ -934,31 +954,14 @@ def index():
 def favicon():
     return ('', 204)
 
-@app.route('/events')
-def events():
-    def event_stream():
-        last_stats = None
-        last_lut = None
-        while True:
-            with stats_lock:
-                current_stats = stats_data.copy()
-            current_lut = build_status.copy()
+@app.route('/stats')
+def stats():
+    with stats_lock:
+        return jsonify(stats_data)
 
-            payload = {}
-            if current_stats != last_stats:
-                payload['stats'] = current_stats
-                last_stats = current_stats
-            
-            if current_lut != last_lut:
-                payload['lut'] = current_lut
-                last_lut = current_lut
-
-            if payload:
-                yield f"data: {json.dumps(payload)}\n\n"
-            
-            time.sleep(0.2)
-            
-    return Response(event_stream(), mimetype='text/event-stream')
+@app.route('/lut_status')
+def lut_status():
+    return jsonify(build_status)
 
 @app.route("/update_config", methods=["POST"])
 def update_config():
